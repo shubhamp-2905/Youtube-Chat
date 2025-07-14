@@ -1,0 +1,1675 @@
+#requirements.txt
+
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+youtube-transcript-api==0.6.1
+google-generativeai==0.3.2
+sentence-transformers==2.2.2
+chromadb==0.4.18
+python-dotenv==1.0.0
+pydantic==2.5.0
+requests==2.31.0
+numpy==1.24.3
+langchain==0.0.352
+langchain-community==0.0.1
+langchain-google-genai==0.0.7
+pytube==15.0.0
+regex==2023.10.3
+tiktoken==0.5.2
+
+#congig.py
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Config:
+    # Gemini API Configuration
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    
+    # Vector Store Configuration
+    VECTOR_STORE_PATH = "data/vectors"
+    TRANSCRIPTS_PATH = "data/transcripts"
+    
+    # Embedding Model Configuration
+    EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    
+    # Text Splitting Configuration
+    CHUNK_SIZE = 1000
+    CHUNK_OVERLAP = 200
+    
+    # Retrieval Configuration
+    TOP_K_CHUNKS = 5
+    
+    # LLM Configuration
+    GEMINI_MODEL = "gemini-pro"
+    MAX_TOKENS = 1000
+    TEMPERATURE = 0.7
+    
+    # CORS Configuration
+    ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+# Create directories if they don't exist
+os.makedirs(Config.VECTOR_STORE_PATH, exist_ok=True)
+os.makedirs(Config.TRANSCRIPTS_PATH, exist_ok=True)
+
+
+#document_loader.py
+
+from youtube_transcript_api import YouTubeTranscriptApi
+import json
+import os
+from typing import Optional, Dict, Any
+from utils.youtube_utils import extract_video_id
+from config import Config
+
+class DocumentLoader:
+    def __init__(self):
+        self.transcripts_path = Config.TRANSCRIPTS_PATH
+    
+    def load_transcript(self, youtube_url: str) -> Dict[str, Any]:
+        """
+        Load transcript from YouTube video URL
+        """
+        try:
+            # Extract video ID from URL
+            video_id = extract_video_id(youtube_url)
+            if not video_id:
+                raise ValueError("Invalid YouTube URL")
+            
+            # Check if transcript already exists
+            transcript_file = os.path.join(self.transcripts_path, f"{video_id}.json")
+            if os.path.exists(transcript_file):
+                print(f"Loading cached transcript for video: {video_id}")
+                with open(transcript_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            
+            # Fetch transcript from YouTube
+            print(f"Fetching transcript for video: {video_id}")
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+            
+            # Combine transcript segments into full text
+            full_text = ""
+            timestamps = []
+            
+            for segment in transcript_list:
+                full_text += segment['text'] + " "
+                timestamps.append({
+                    'start': segment['start'],
+                    'duration': segment['duration'],
+                    'text': segment['text']
+                })
+            
+            # Create document data
+            document_data = {
+                'video_id': video_id,
+                'url': youtube_url,
+                'full_text': full_text.strip(),
+                'timestamps': timestamps,
+                'total_segments': len(timestamps)
+            }
+            
+            # Save transcript to file
+            with open(transcript_file, 'w', encoding='utf-8') as f:
+                json.dump(document_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"Transcript loaded successfully. Total segments: {len(timestamps)}")
+            return document_data
+            
+        except Exception as e:
+            print(f"Error loading transcript: {str(e)}")
+            raise Exception(f"Failed to load transcript: {str(e)}")
+    
+    def get_cached_transcript(self, video_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get cached transcript if it exists
+        """
+        transcript_file = os.path.join(self.transcripts_path, f"{video_id}.json")
+        if os.path.exists(transcript_file):
+            with open(transcript_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return None
+    
+    def clear_cache(self, video_id: str = None):
+        """
+        Clear transcript cache for specific video or all videos
+        """
+        if video_id:
+            transcript_file = os.path.join(self.transcripts_path, f"{video_id}.json")
+            if os.path.exists(transcript_file):
+                os.remove(transcript_file)
+                print(f"Cache cleared for video: {video_id}")
+        else:
+            # Clear all cached transcripts
+            for file in os.listdir(self.transcripts_path):
+                if file.endswith('.json'):
+                    os.remove(os.path.join(self.transcripts_path, file))
+            print("All transcript cache cleared")
+
+
+#text_splitter.py
+
+import re
+from typing import List, Dict, Any
+from config import Config
+
+class TextSplitter:
+    def __init__(self, chunk_size: int = None, chunk_overlap: int = None):
+        self.chunk_size = chunk_size or Config.CHUNK_SIZE
+        self.chunk_overlap = chunk_overlap or Config.CHUNK_OVERLAP
+    
+    def split_text(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Split text into chunks with overlap
+        """
+        try:
+            # Clean the text
+            cleaned_text = self._clean_text(text)
+            
+            # Split into sentences for better chunking
+            sentences = self._split_into_sentences(cleaned_text)
+            
+            chunks = []
+            current_chunk = ""
+            current_length = 0
+            chunk_id = 0
+            
+            for sentence in sentences:
+                sentence_length = len(sentence)
+                
+                # If adding this sentence would exceed chunk size, save current chunk
+                if current_length + sentence_length > self.chunk_size and current_chunk:
+                    chunks.append({
+                        'id': chunk_id,
+                        'text': current_chunk.strip(),
+                        'length': len(current_chunk.strip())
+                    })
+                    
+                    chunk_id += 1
+                    
+                    # Start new chunk with overlap
+                    if self.chunk_overlap > 0:
+                        overlap_text = self._get_overlap_text(current_chunk, self.chunk_overlap)
+                        current_chunk = overlap_text + " " + sentence
+                        current_length = len(current_chunk)
+                    else:
+                        current_chunk = sentence
+                        current_length = sentence_length
+                else:
+                    # Add sentence to current chunk
+                    if current_chunk:
+                        current_chunk += " " + sentence
+                    else:
+                        current_chunk = sentence
+                    current_length += sentence_length
+            
+            # Add the last chunk if it exists
+            if current_chunk.strip():
+                chunks.append({
+                    'id': chunk_id,
+                    'text': current_chunk.strip(),
+                    'length': len(current_chunk.strip())
+                })
+            
+            print(f"Text split into {len(chunks)} chunks")
+            return chunks
+            
+        except Exception as e:
+            print(f"Error splitting text: {str(e)}")
+            raise Exception(f"Failed to split text: {str(e)}")
+    
+    def _clean_text(self, text: str) -> str:
+        """
+        Clean and normalize text
+        """
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove special characters that might interfere with processing
+        text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)]', '', text)
+        
+        # Fix common transcript issues
+        text = text.replace(' .', '.')
+        text = text.replace(' ,', ',')
+        text = text.replace(' !', '!')
+        text = text.replace(' ?', '?')
+        
+        return text.strip()
+    
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """
+        Split text into sentences using simple regex
+        """
+        # Split by sentence endings
+        sentences = re.split(r'[.!?]+', text)
+        
+        # Clean and filter empty sentences
+        cleaned_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if sentence and len(sentence) > 10:  # Minimum sentence length
+                cleaned_sentences.append(sentence)
+        
+        return cleaned_sentences
+    
+    def _get_overlap_text(self, text: str, overlap_size: int) -> str:
+        """
+        Get the last part of text for overlap
+        """
+        if len(text) <= overlap_size:
+            return text
+        
+        # Try to find a good breaking point (end of sentence)
+        overlap_text = text[-overlap_size:]
+        
+        # Find the first sentence ending in the overlap
+        for i, char in enumerate(overlap_text):
+            if char in '.!?':
+                return overlap_text[i+1:].strip()
+        
+        # If no sentence ending found, return the overlap as is
+        return overlap_text.strip()
+    
+    def get_chunk_stats(self, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Get statistics about the chunks
+        """
+        if not chunks:
+            return {'total_chunks': 0, 'total_length': 0, 'avg_length': 0}
+        
+        total_length = sum(chunk['length'] for chunk in chunks)
+        avg_length = total_length / len(chunks)
+        
+        return {
+            'total_chunks': len(chunks),
+            'total_length': total_length,
+            'avg_length': round(avg_length, 2),
+            'min_length': min(chunk['length'] for chunk in chunks),
+            'max_length': max(chunk['length'] for chunk in chunks)
+        }
+
+
+#embedding_model.py
+
+import chromadb
+import json
+import os
+from typing import List, Dict, Any, Optional
+from config import Config
+
+class VectorStore:
+    def __init__(self, collection_name: str = "youtube_transcripts"):
+        self.collection_name = collection_name
+        self.persist_directory = Config.VECTOR_STORE_PATH
+        
+        try:
+            # Initialize ChromaDB client
+            self.client = chromadb.PersistentClient(path=self.persist_directory)
+            print(f"ChromaDB client initialized with path: {self.persist_directory}")
+            
+            # Get or create collection
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"description": "YouTube video transcripts for RAG chatbot"}
+            )
+            print(f"Collection '{self.collection_name}' ready")
+            
+        except Exception as e:
+            print(f"Error initializing vector store: {str(e)}")
+            raise Exception(f"Failed to initialize vector store: {str(e)}")
+    
+    def add_documents(self, video_id: str, chunks: List[Dict[str, Any]]) -> bool:
+        """
+        Add document chunks to the vector store
+        """
+        try:
+            # Check if video already exists
+            if self.video_exists(video_id):
+                print(f"Video {video_id} already exists in vector store")
+                return True
+            
+            # Prepare data for ChromaDB
+            documents = []
+            embeddings = []
+            ids = []
+            metadatas = []
+            
+            for chunk in chunks:
+                # Create unique ID for each chunk
+                chunk_id = f"{video_id}_{chunk['id']}"
+                
+                documents.append(chunk['text'])
+                embeddings.append(chunk['embedding'])
+                ids.append(chunk_id)
+                metadatas.append({
+                    'video_id': video_id,
+                    'chunk_id': chunk['id'],
+                    'length': chunk['length']
+                })
+            
+            # Add to collection
+            self.collection.add(
+                documents=documents,
+                embeddings=embeddings,
+                ids=ids,
+                metadatas=metadatas
+            )
+            
+            print(f"Added {len(chunks)} chunks for video {video_id} to vector store")
+            return True
+            
+        except Exception as e:
+            print(f"Error adding documents to vector store: {str(e)}")
+            return False
+    
+    def search_similar(self, query_embedding: List[float], 
+                      video_id: str = None, 
+                      top_k: int = None) -> List[Dict[str, Any]]:
+        """
+        Search for similar documents in the vector store
+        """
+        try:
+            top_k = top_k or Config.TOP_K_CHUNKS
+            
+            # Prepare where clause for filtering by video_id if provided
+            where_clause = {"video_id": video_id} if video_id else None
+            
+            # Query the collection
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                where=where_clause,
+                include=['documents', 'metadatas', 'distances']
+            )
+            
+            # Format results
+            similar_chunks = []
+            if results['documents'] and results['documents'][0]:
+                for i in range(len(results['documents'][0])):
+                    chunk = {
+                        'text': results['documents'][0][i],
+                        'metadata': results['metadatas'][0][i],
+                        'distance': results['distances'][0][i],
+                        'similarity': 1 - results['distances'][0][i]  # Convert distance to similarity
+                    }
+                    similar_chunks.append(chunk)
+            
+            print(f"Found {len(similar_chunks)} similar chunks")
+            return similar_chunks
+            
+        except Exception as e:
+            print(f"Error searching vector store: {str(e)}")
+            return []
+    
+    def video_exists(self, video_id: str) -> bool:
+        """
+        Check if a video already exists in the vector store
+        """
+        try:
+            results = self.collection.get(
+                where={"video_id": video_id},
+                limit=1
+            )
+            return len(results['ids']) > 0
+        except Exception as e:
+            print(f"Error checking if video exists: {str(e)}")
+            return False
+    
+    def get_video_chunks(self, video_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all chunks for a specific video
+        """
+        try:
+            results = self.collection.get(
+                where={"video_id": video_id},
+                include=['documents', 'metadatas']
+            )
+            
+            chunks = []
+            if results['documents']:
+                for i in range(len(results['documents'])):
+                    chunk = {
+                        'text': results['documents'][i],
+                        'metadata': results['metadatas'][i]
+                    }
+                    chunks.append(chunk)
+            
+            return chunks
+            
+        except Exception as e:
+            print(f"Error getting video chunks: {str(e)}")
+            return []
+    
+    def delete_video(self, video_id: str) -> bool:
+        """
+        Delete all chunks for a specific video
+        """
+        try:
+            # Get all IDs for the video
+            results = self.collection.get(
+                where={"video_id": video_id}
+            )
+            
+            if results['ids']:
+                self.collection.delete(
+                    ids=results['ids']
+                )
+                print(f"Deleted {len(results['ids'])} chunks for video {video_id}")
+                return True
+            else:
+                print(f"No chunks found for video {video_id}")
+                return False
+                
+        except Exception as e:
+            print(f"Error deleting video chunks: {str(e)}")
+            return False
+    
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about the collection
+        """
+        try:
+            count = self.collection.count()
+            
+            # Get unique video count
+            all_metadata = self.collection.get(include=['metadatas'])
+            unique_videos = set()
+            if all_metadata['metadatas']:
+                for metadata in all_metadata['metadatas']:
+                    unique_videos.add(metadata['video_id'])
+            
+            return {
+                'total_chunks': count,
+                'unique_videos': len(unique_videos),
+                'collection_name': self.collection_name
+            }
+            
+        except Exception as e:
+            print(f"Error getting collection stats: {str(e)}")
+            return {'error': str(e)}
+    
+    def clear_collection(self) -> bool:
+        """
+        Clear all data from the collection
+        """
+        try:
+            # Delete the collection
+            self.client.delete_collection(self.collection_name)
+            
+            # Recreate the collection
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"description": "YouTube video transcripts for RAG chatbot"}
+            )
+            
+            print(f"Collection '{self.collection_name}' cleared")
+            return True
+            
+        except Exception as e:
+            print(f"Error clearing collection: {str(e)}")
+            return False
+
+
+#vector_store.py
+
+import chromadb
+import json
+import os
+from typing import List, Dict, Any, Optional
+from config import Config
+
+class VectorStore:
+    def __init__(self, collection_name: str = "youtube_transcripts"):
+        self.collection_name = collection_name
+        self.persist_directory = Config.VECTOR_STORE_PATH
+        
+        try:
+            # Initialize ChromaDB client
+            self.client = chromadb.PersistentClient(path=self.persist_directory)
+            print(f"ChromaDB client initialized with path: {self.persist_directory}")
+            
+            # Get or create collection
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"description": "YouTube video transcripts for RAG chatbot"}
+            )
+            print(f"Collection '{self.collection_name}' ready")
+            
+        except Exception as e:
+            print(f"Error initializing vector store: {str(e)}")
+            raise Exception(f"Failed to initialize vector store: {str(e)}")
+    
+    def add_documents(self, video_id: str, chunks: List[Dict[str, Any]]) -> bool:
+        """
+        Add document chunks to the vector store
+        """
+        try:
+            # Check if video already exists
+            if self.video_exists(video_id):
+                print(f"Video {video_id} already exists in vector store")
+                return True
+            
+            # Prepare data for ChromaDB
+            documents = []
+            embeddings = []
+            ids = []
+            metadatas = []
+            
+            for chunk in chunks:
+                # Create unique ID for each chunk
+                chunk_id = f"{video_id}_{chunk['id']}"
+                
+                documents.append(chunk['text'])
+                embeddings.append(chunk['embedding'])
+                ids.append(chunk_id)
+                metadatas.append({
+                    'video_id': video_id,
+                    'chunk_id': chunk['id'],
+                    'length': chunk['length']
+                })
+            
+            # Add to collection
+            self.collection.add(
+                documents=documents,
+                embeddings=embeddings,
+                ids=ids,
+                metadatas=metadatas
+            )
+            
+            print(f"Added {len(chunks)} chunks for video {video_id} to vector store")
+            return True
+            
+        except Exception as e:
+            print(f"Error adding documents to vector store: {str(e)}")
+            return False
+    
+    def search_similar(self, query_embedding: List[float], 
+                      video_id: str = None, 
+                      top_k: int = None) -> List[Dict[str, Any]]:
+        """
+        Search for similar documents in the vector store
+        """
+        try:
+            top_k = top_k or Config.TOP_K_CHUNKS
+            
+            # Prepare where clause for filtering by video_id if provided
+            where_clause = {"video_id": video_id} if video_id else None
+            
+            # Query the collection
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                where=where_clause,
+                include=['documents', 'metadatas', 'distances']
+            )
+            
+            # Format results
+            similar_chunks = []
+            if results['documents'] and results['documents'][0]:
+                for i in range(len(results['documents'][0])):
+                    chunk = {
+                        'text': results['documents'][0][i],
+                        'metadata': results['metadatas'][0][i],
+                        'distance': results['distances'][0][i],
+                        'similarity': 1 - results['distances'][0][i]  # Convert distance to similarity
+                    }
+                    similar_chunks.append(chunk)
+            
+            print(f"Found {len(similar_chunks)} similar chunks")
+            return similar_chunks
+            
+        except Exception as e:
+            print(f"Error searching vector store: {str(e)}")
+            return []
+    
+    def video_exists(self, video_id: str) -> bool:
+        """
+        Check if a video already exists in the vector store
+        """
+        try:
+            results = self.collection.get(
+                where={"video_id": video_id},
+                limit=1
+            )
+            return len(results['ids']) > 0
+        except Exception as e:
+            print(f"Error checking if video exists: {str(e)}")
+            return False
+    
+    def get_video_chunks(self, video_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all chunks for a specific video
+        """
+        try:
+            results = self.collection.get(
+                where={"video_id": video_id},
+                include=['documents', 'metadatas']
+            )
+            
+            chunks = []
+            if results['documents']:
+                for i in range(len(results['documents'])):
+                    chunk = {
+                        'text': results['documents'][i],
+                        'metadata': results['metadatas'][i]
+                    }
+                    chunks.append(chunk)
+            
+            return chunks
+            
+        except Exception as e:
+            print(f"Error getting video chunks: {str(e)}")
+            return []
+    
+    def delete_video(self, video_id: str) -> bool:
+        """
+        Delete all chunks for a specific video
+        """
+        try:
+            # Get all IDs for the video
+            results = self.collection.get(
+                where={"video_id": video_id}
+            )
+            
+            if results['ids']:
+                self.collection.delete(
+                    ids=results['ids']
+                )
+                print(f"Deleted {len(results['ids'])} chunks for video {video_id}")
+                return True
+            else:
+                print(f"No chunks found for video {video_id}")
+                return False
+                
+        except Exception as e:
+            print(f"Error deleting video chunks: {str(e)}")
+            return False
+    
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about the collection
+        """
+        try:
+            count = self.collection.count()
+            
+            # Get unique video count
+            all_metadata = self.collection.get(include=['metadatas'])
+            unique_videos = set()
+            if all_metadata['metadatas']:
+                for metadata in all_metadata['metadatas']:
+                    unique_videos.add(metadata['video_id'])
+            
+            return {
+                'total_chunks': count,
+                'unique_videos': len(unique_videos),
+                'collection_name': self.collection_name
+            }
+            
+        except Exception as e:
+            print(f"Error getting collection stats: {str(e)}")
+            return {'error': str(e)}
+    
+    def clear_collection(self) -> bool:
+        """
+        Clear all data from the collection
+        """
+        try:
+            # Delete the collection
+            self.client.delete_collection(self.collection_name)
+            
+            # Recreate the collection
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"description": "YouTube video transcripts for RAG chatbot"}
+            )
+            
+            print(f"Collection '{self.collection_name}' cleared")
+            return True
+            
+        except Exception as e:
+            print(f"Error clearing collection: {str(e)}")
+            return False
+
+
+#retriever.py
+
+from typing import List, Dict, Any
+from rag.embedding_model import EmbeddingModel
+from rag.vector_store import VectorStore
+from config import Config
+
+class Retriever:
+    def __init__(self):
+        self.embedding_model = EmbeddingModel()
+        self.vector_store = VectorStore()
+        self.top_k = Config.TOP_K_CHUNKS
+    
+    def retrieve_context(self, query: str, video_id: str = None) -> Dict[str, Any]:
+        """
+        Retrieve relevant context for a given query
+        """
+        try:
+            print(f"Retrieving context for query: '{query[:50]}...'")
+            
+            # Generate embedding for the query
+            query_embedding = self.embedding_model.generate_single_embedding(query)
+            
+            # Search for similar chunks in vector store
+            similar_chunks = self.vector_store.search_similar(
+                query_embedding=query_embedding,
+                video_id=video_id,
+                top_k=self.top_k
+            )
+            
+            if not similar_chunks:
+                print("No relevant context found")
+                return {
+                    'context': "",
+                    'relevant_chunks': [],
+                    'query': query,
+                    'video_id': video_id
+                }
+            
+            # Combine relevant chunks into context
+            context_parts = []
+            relevant_chunks = []
+            
+            for chunk in similar_chunks:
+                context_parts.append(chunk['text'])
+                relevant_chunks.append({
+                    'text': chunk['text'][:200] + "..." if len(chunk['text']) > 200 else chunk['text'],
+                    'similarity': round(chunk['similarity'], 3),
+                    'chunk_id': chunk['metadata']['chunk_id']
+                })
+            
+            # Join context with separators
+            context = "\n\n".join(context_parts)
+            
+            print(f"Retrieved {len(similar_chunks)} relevant chunks")
+            
+            return {
+                'context': context,
+                'relevant_chunks': relevant_chunks,
+                'query': query,
+                'video_id': video_id,
+                'total_chunks': len(similar_chunks)
+            }
+            
+        except Exception as e:
+            print(f"Error retrieving context: {str(e)}")
+            return {
+                'context': "",
+                'relevant_chunks': [],
+                'query': query,
+                'video_id': video_id,
+                'error': str(e)
+            }
+    
+    def retrieve_with_threshold(self, query: str, video_id: str = None, 
+                              similarity_threshold: float = 0.5) -> Dict[str, Any]:
+        """
+        Retrieve context with minimum similarity threshold
+        """
+        try:
+            # Get initial results
+            result = self.retrieve_context(query, video_id)
+            
+            if 'error' in result:
+                return result
+            
+            # Filter by similarity threshold
+            filtered_chunks = [
+                chunk for chunk in result['relevant_chunks'] 
+                if chunk['similarity'] >= similarity_threshold
+            ]
+            
+            if not filtered_chunks:
+                return {
+                    'context': "",
+                    'relevant_chunks': [],
+                    'query': query,
+                    'video_id': video_id,
+                    'message': f"No chunks found above similarity threshold {similarity_threshold}"
+                }
+            
+            # Rebuild context from filtered chunks
+            context_parts = []
+            for chunk in filtered_chunks:
+                # Get full text from original chunks
+                for original_chunk in result['relevant_chunks']:
+                    if original_chunk['chunk_id'] == chunk['chunk_id']:
+                        context_parts.append(original_chunk['text'])
+                        break
+            
+            context = "\n\n".join(context_parts)
+            
+            return {
+                'context': context,
+                'relevant_chunks': filtered_chunks,
+                'query': query,
+                'video_id': video_id,
+                'total_chunks': len(filtered_chunks),
+                'similarity_threshold': similarity_threshold
+            }
+            
+        except Exception as e:
+            print(f"Error retrieving with threshold: {str(e)}")
+            return {
+                'context': "",
+                'relevant_chunks': [],
+                'query': query,
+                'video_id': video_id,
+                'error': str(e)
+            }
+    
+    def get_retrieval_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about the retrieval system
+        """
+        try:
+            vector_stats = self.vector_store.get_collection_stats()
+            embedding_info = self.embedding_model.get_model_info()
+            
+            return {
+                'vector_store': vector_stats,
+                'embedding_model': embedding_info,
+                'top_k_chunks': self.top_k
+            }
+            
+        except Exception as e:
+            print(f"Error getting retrieval stats: {str(e)}")
+            return {'error': str(e)}
+
+
+#llm_handler.py
+
+import google.generativeai as genai
+from typing import Dict, Any, Optional
+from config import Config
+
+class LLMHandler:
+    def __init__(self):
+        self.api_key = Config.GEMINI_API_KEY
+        self.model_name = Config.GEMINI_MODEL
+        self.max_tokens = Config.MAX_TOKENS
+        self.temperature = Config.TEMPERATURE
+        
+        if not self.api_key:
+            raise ValueError("GEMINI_API_KEY not found in environment variables")
+        
+        try:
+            # Configure Gemini API
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel(self.model_name)
+            print(f"Gemini model '{self.model_name}' initialized successfully")
+        except Exception as e:
+            print(f"Error initializing Gemini model: {str(e)}")
+            raise Exception(f"Failed to initialize Gemini model: {str(e)}")
+    
+    def generate_response(self, query: str, context: str, video_id: str = None) -> Dict[str, Any]:
+        """
+        Generate response using Gemini with context from video transcript
+        """
+        try:
+            # Create prompt with context
+            prompt = self._create_prompt(query, context, video_id)
+            
+            print(f"Generating response for query: '{query[:50]}...'")
+            
+            # Generate response
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                )
+            )
+            
+            if response.text:
+                print("Response generated successfully")
+                return {
+                    'response': response.text,
+                    'query': query,
+                    'video_id': video_id,
+                    'has_context': bool(context.strip()),
+                    'context_length': len(context)
+                }
+            else:
+                print("Empty response from Gemini")
+                return {
+                    'response': "I apologize, but I couldn't generate a response. Please try rephrasing your question.",
+                    'query': query,
+                    'video_id': video_id,
+                    'error': "Empty response from model"
+                }
+                
+        except Exception as e:
+            print(f"Error generating response: {str(e)}")
+            return {
+                'response': "I apologize, but I encountered an error while generating a response. Please try again.",
+                'query': query,
+                'video_id': video_id,
+                'error': str(e)
+            }
+    
+    def _create_prompt(self, query: str, context: str, video_id: str = None) -> str:
+        """
+        Create a well-structured prompt for the LLM
+        """
+        base_prompt = """You are an AI assistant that helps users understand YouTube video content. You have access to the transcript of a YouTube video and can answer questions based on that content.
+
+Instructions:
+1. Answer the user's question based primarily on the provided video transcript context
+2. Be accurate and only use information from the provided context
+3. If the context doesn't contain enough information to answer the question, say so clearly
+4. Provide clear, concise, and helpful responses
+5. If relevant, you can reference specific parts of the video content
+6. Maintain a friendly and helpful tone
+
+"""
+        
+        if context.strip():
+            context_prompt = f"""Video Transcript Context:
+{context}
+
+"""
+        else:
+            context_prompt = "No specific video context was found for this query.\n\n"
+        
+        user_prompt = f"""User Question: {query}
+
+Please provide a comprehensive answer based on the video transcript context above."""
+        
+        return base_prompt + context_prompt + user_prompt
+    
+    def generate_summary(self, full_transcript: str, video_id: str = None) -> Dict[str, Any]:
+        """
+        Generate a summary of the entire video transcript
+        """
+        try:
+            prompt = f"""Please provide a comprehensive summary of this YouTube video transcript. 
+            
+Key points to include:
+1. Main topic/theme of the video
+2. Key points discussed
+3. Important insights or conclusions
+4. Structure/flow of the content
+
+Transcript:
+{full_transcript[:8000]}...  # Limit to avoid token limits
+
+Please provide a clear and structured summary."""
+
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=500,
+                    temperature=0.3,
+                )
+            )
+            
+            if response.text:
+                return {
+                    'summary': response.text,
+                    'video_id': video_id,
+                    'transcript_length': len(full_transcript)
+                }
+            else:
+                return {
+                    'summary': "Unable to generate summary",
+                    'video_id': video_id,
+                    'error': "Empty response from model"
+                }
+                
+        except Exception as e:
+            print(f"Error generating summary: {str(e)}")
+            return {
+                'summary': "Error generating summary",
+                'video_id': video_id,
+                'error': str(e)
+            }
+    
+    def chat_without_context(self, query: str) -> Dict[str, Any]:
+        """
+        Generate response without video context (general chat)
+        """
+        try:
+            prompt = f"""You are a helpful AI assistant. The user is asking a general question not related to any specific video content.
+
+User Question: {query}
+
+Please provide a helpful and informative response."""
+
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                )
+            )
+            
+            if response.text:
+                return {
+                    'response': response.text,
+                    'query': query,
+                    'has_context': False
+                }
+            else:
+                return {
+                    'response': "I apologize, but I couldn't generate a response. Please try rephrasing your question.",
+                    'query': query,
+                    'error': "Empty response from model"
+                }
+                
+        except Exception as e:
+            print(f"Error in general chat: {str(e)}")
+            return {
+                'response': "I apologize, but I encountered an error. Please try again.",
+                'query': query,
+                'error': str(e)
+            }
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """
+        Get information about the LLM model
+        """
+        return {
+            'model_name': self.model_name,
+            'max_tokens': self.max_tokens,
+            'temperature': self.temperature,
+            'api_configured': bool(self.api_key)
+        }
+
+
+#youtube_utils.py
+
+import re
+from typing import Optional
+from urllib.parse import urlparse, parse_qs
+
+def extract_video_id(url: str) -> Optional[str]:
+    """
+    Extract YouTube video ID from various YouTube URL formats
+    """
+    if not url:
+        return None
+    
+    # Regular expression patterns for different YouTube URL formats
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/watch\?.*v=([a-zA-Z0-9_-]{11})',
+        r'youtu\.be/([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/v/([a-zA-Z0-9_-]{11})',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    return None
+
+def is_valid_youtube_url(url: str) -> bool:
+    """
+    Check if the URL is a valid YouTube URL
+    """
+    if not url:
+        return False
+    
+    youtube_domains = [
+        'youtube.com',
+        'www.youtube.com',
+        'youtu.be',
+        'www.youtu.be',
+        'm.youtube.com'
+    ]
+    
+    try:
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc.lower()
+        
+        # Check if domain is YouTube
+        if domain not in youtube_domains:
+            return False
+        
+        # Check if we can extract a video ID
+        video_id = extract_video_id(url)
+        return video_id is not None and len(video_id) == 11
+        
+    except Exception:
+        return False
+
+def get_video_info_from_url(url: str) -> dict:
+    """
+    Extract basic info from YouTube URL
+    """
+    try:
+        video_id = extract_video_id(url)
+        
+        if not video_id:
+            return {
+                'valid': False,
+                'error': 'Invalid YouTube URL'
+            }
+        
+        # Create standard YouTube URL
+        standard_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        return {
+            'valid': True,
+            'video_id': video_id,
+            'original_url': url,
+            'standard_url': standard_url,
+            'embed_url': f"https://www.youtube.com/embed/{video_id}",
+            'thumbnail_url': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+        }
+        
+    except Exception as e:
+        return {
+            'valid': False,
+            'error': str(e)
+        }
+
+def normalize_youtube_url(url: str) -> Optional[str]:
+    """
+    Normalize YouTube URL to standard format
+    """
+    video_id = extract_video_id(url)
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return None
+
+def extract_playlist_id(url: str) -> Optional[str]:
+    """
+    Extract playlist ID from YouTube URL (future feature)
+    """
+    try:
+        parsed_url = urlparse(url)
+        query_params = parse_qs(parsed_url.query)
+        
+        if 'list' in query_params:
+            return query_params['list'][0]
+        
+        return None
+        
+    except Exception:
+        return None
+
+def is_youtube_shorts_url(url: str) -> bool:
+    """
+    Check if URL is a YouTube Shorts URL
+    """
+    return '/shorts/' in url.lower()
+
+def validate_and_clean_url(url: str) -> dict:
+    """
+    Validate and clean YouTube URL with detailed response
+    """
+    try:
+        # Remove whitespace
+        url = url.strip()
+        
+        # Add protocol if missing
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        # Check if it's a valid YouTube URL
+        if not is_valid_youtube_url(url):
+            return {
+                'valid': False,
+                'error': 'Not a valid YouTube URL',
+                'original_url': url
+            }
+        
+        # Extract video information
+        video_info = get_video_info_from_url(url)
+        
+        if not video_info['valid']:
+            return video_info
+        
+        # Additional checks
+        is_shorts = is_youtube_shorts_url(url)
+        playlist_id = extract_playlist_id(url)
+        
+        return {
+            'valid': True,
+            'video_id': video_info['video_id'],
+            'original_url': url,
+            'clean_url': video_info['standard_url'],
+            'embed_url': video_info['embed_url'],
+            'thumbnail_url': video_info['thumbnail_url'],
+            'is_shorts': is_shorts,
+            'playlist_id': playlist_id,
+            'message': 'URL validated and cleaned successfully'
+        }
+        
+    except Exception as e:
+        return {
+            'valid': False,
+            'error': f'Error processing URL: {str(e)}',
+            'original_url': url
+        }
+
+    
+#main.py
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Import RAG components
+from rag.document_loader import DocumentLoader
+from rag.text_splitter import TextSplitter
+from rag.embedding_model import EmbeddingModel
+from rag.vector_store import VectorStore
+from rag.retriever import Retriever
+from rag.llm_handler import LLMHandler
+from utils.youtube_utils import validate_and_clean_url
+from config import Config
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="YouTube RAG Chatbot API",
+    description="A RAG-based chatbot for YouTube video content",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=Config.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize components
+document_loader = DocumentLoader()
+text_splitter = TextSplitter()
+embedding_model = EmbeddingModel()
+vector_store = VectorStore()
+retriever = Retriever()
+llm_handler = LLMHandler()
+
+# Thread pool for CPU-intensive tasks
+executor = ThreadPoolExecutor(max_workers=2)
+
+# Pydantic models
+class VideoProcessRequest(BaseModel):
+    youtube_url: str
+
+class ChatRequest(BaseModel):
+    query: str
+    video_id: Optional[str] = None
+
+class VideoProcessResponse(BaseModel):
+    success: bool
+    message: str
+    video_id: Optional[str] = None
+    video_info: Optional[Dict[str, Any]] = None
+    processing_stats: Optional[Dict[str, Any]] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    query: str
+    video_id: Optional[str] = None
+    context_used: bool = False
+    relevant_chunks: Optional[list] = None
+
+# Global storage for processed videos
+processed_videos = {}
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "YouTube RAG Chatbot API",
+        "status": "running",
+        "version": "1.0.0"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Check if all components are working
+        stats = vector_store.get_collection_stats()
+        model_info = llm_handler.get_model_info()
+        
+        return {
+            "status": "healthy",
+            "components": {
+                "vector_store": "ok" if 'error' not in stats else "error",
+                "llm_handler": "ok" if model_info.get('api_configured') else "error",
+                "embedding_model": "ok"
+            },
+            "stats": stats
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "unhealthy", "error": str(e)}
+        )
+
+def process_video_sync(youtube_url: str) -> Dict[str, Any]:
+    """
+    Synchronous video processing function
+    """
+    try:
+        # Step 1: Validate URL
+        url_info = validate_and_clean_url(youtube_url)
+        if not url_info['valid']:
+            return {
+                'success': False,
+                'message': url_info['error'],
+                'step': 'url_validation'
+            }
+        
+        video_id = url_info['video_id']
+        
+        # Step 2: Check if already processed
+        if vector_store.video_exists(video_id):
+            return {
+                'success': True,
+                'message': 'Video already processed',
+                'video_id': video_id,
+                'video_info': url_info,
+                'step': 'already_processed'
+            }
+        
+        # Step 3: Load transcript
+        print(f"Loading transcript for video: {video_id}")
+        document_data = document_loader.load_transcript(url_info['clean_url'])
+        
+        # Step 4: Split text into chunks
+        print("Splitting text into chunks...")
+        chunks = text_splitter.split_text(document_data['full_text'])
+        
+        # Step 5: Generate embeddings
+        print("Generating embeddings...")
+        embedded_chunks = embedding_model.embed_chunks(chunks)
+        
+        # Step 6: Store in vector database
+        print("Storing in vector database...")
+        success = vector_store.add_documents(video_id, embedded_chunks)
+        
+        if success:
+            # Store video info
+            processed_videos[video_id] = {
+                'url_info': url_info,
+                'document_data': document_data,
+                'processing_stats': {
+                    'total_chunks': len(chunks),
+                    'transcript_length': len(document_data['full_text']),
+                    'total_segments': document_data['total_segments']
+                }
+            }
+            
+            return {
+                'success': True,
+                'message': 'Video processed successfully',
+                'video_id': video_id,
+                'video_info': url_info,
+                'processing_stats': processed_videos[video_id]['processing_stats'],
+                'step': 'completed'
+            }
+        else:
+            return {
+                'success': False,
+                'message': 'Failed to store video data',
+                'step': 'vector_storage'
+            }
+            
+    except Exception as e:
+        print(f"Error processing video: {str(e)}")
+        return {
+            'success': False,
+            'message': f'Error processing video: {str(e)}',
+            'step': 'processing_error'
+        }
+
+@app.post("/process-video", response_model=VideoProcessResponse)
+async def process_video(request: VideoProcessRequest):
+    """
+    Process a YouTube video for RAG
+    """
+    try:
+        # Run the synchronous processing in a thread pool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor, 
+            process_video_sync, 
+            request.youtube_url
+        )
+        
+        if result['success']:
+            return VideoProcessResponse(**result)
+        else:
+            raise HTTPException(status_code=400, detail=result['message'])
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Chat with the RAG system
+    """
+    try:
+        if request.video_id:
+            # Chat with video context
+            print(f"Chat request for video: {request.video_id}")
+            
+            # Check if video exists
+            if not vector_store.video_exists(request.video_id):
+                raise HTTPException(status_code=404, detail="Video not found. Please process the video first.")
+            
+            # Retrieve relevant context
+            context_result = retriever.retrieve_context(request.query, request.video_id)
+            
+            # Generate response with context
+            response_result = llm_handler.generate_response(
+                request.query, 
+                context_result['context'], 
+                request.video_id
+            )
+            
+            return ChatResponse(
+                response=response_result['response'],
+                query=request.query,
+                video_id=request.video_id,
+                context_used=True,
+                relevant_chunks=context_result.get('relevant_chunks', [])
+            )
+        else:
+            # General chat without video context
+            print("General chat request (no video context)")
+            response_result = llm_handler.chat_without_context(request.query)
+            
+            return ChatResponse(
+                response=response_result['response'],
+                query=request.query,
+                context_used=False
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in chat: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/video/{video_id}/summary")
+async def get_video_summary(video_id: str):
+    """
+    Get summary of a processed video
+    """
+    try:
+        if not vector_store.video_exists(video_id):
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get video data
+        if video_id in processed_videos:
+            document_data = processed_videos[video_id]['document_data']
+            summary_result = llm_handler.generate_summary(
+                document_data['full_text'], 
+                video_id
+            )
+            return summary_result
+        else:
+            raise HTTPException(status_code=404, detail="Video data not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/video/{video_id}/info")
+async def get_video_info(video_id: str):
+    """
+    Get information about a processed video
+    """
+    try:
+        if not vector_store.video_exists(video_id):
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        if video_id in processed_videos:
+            return processed_videos[video_id]
+        else:
+            # Return basic info from vector store
+            chunks = vector_store.get_video_chunks(video_id)
+            return {
+                'video_id': video_id,
+                'chunk_count': len(chunks),
+                'status': 'processed'
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/stats")
+async def get_system_stats():
+    """
+    Get system statistics
+    """
+    try:
+        vector_stats = vector_store.get_collection_stats()
+        retrieval_stats = retriever.get_retrieval_stats()
+        model_info = llm_handler.get_model_info()
+        
+        return {
+            'vector_store': vector_stats,
+            'retrieval_system': retrieval_stats,
+            'llm_model': model_info,
+            'processed_videos_count': len(processed_videos)
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.delete("/video/{video_id}")
+async def delete_video(video_id: str):
+    """
+    Delete a processed video from the system
+    """
+    try:
+        # Delete from vector store
+        deleted = vector_store.delete_video(video_id)
+        
+        # Remove from processed videos
+        if video_id in processed_videos:
+            del processed_videos[video_id]
+        
+        if deleted:
+            return {"message": f"Video {video_id} deleted successfully"}
+        else:
+            raise HTTPException(status_code=404, detail="Video not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+# Package.json
+
+{
+  "name": "youtube-chatbot-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.37",
+    "@types/react-dom": "^18.2.15",
+    "@vitejs/plugin-react": "^4.1.0",
+    "vite": "^4.5.0"
+  }
+}
+
+
+#App.jsx
+
+import React, { useState, useEffect } from 'react';
+import VideoInput from './components/VideoInput';
+import ChatInterface from './components/ChatInterface';
+import LoadingSpinner from './components/LoadingSpinner';
+import { processVideo, sendChatMessage, getSystemStats } from './utils/api';
+import './styles/App.css';
+
+function App() {
+  const [currentVideoId, setCurrentVideoId] = useState(null);
+  const [videoInfo, setVideoInfo] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [systemStats, setSystemStats] = useState(null);
+
+  // Initialize with welcome message
+  useEffect(() => {
+    setMessages([
+      {
+        id: 1,
+        type: 'assistant
+
+
+        ...... next code
+
+
+
+YouTube Chatbot - Folder Structure `youtube-chatbot/ │ ├── frontend/ # React-Vite Frontend │ ├── public/ │ │ └── vite.svg │ ├── src/ │ │ ├── components/ │ │ │ ├── ChatInterface.jsx │ │ │ ├── VideoInput.jsx │ │ │ ├── MessageBubble.jsx │ │ │ └── LoadingSpinner.jsx │ │ ├── styles/ │ │ │ ├── App.css │ │ │ ├── ChatInterface.css │ │ │ ├── VideoInput.css │ │ │ └── MessageBubble.css │ │ ├── utils/ │ │ │ └── api.js │ │ ├── App.jsx │ │ ├── main.jsx │ │ └── index.css │ ├── package.json │ ├── vite.config.js │ └── index.html │ ├── backend/ # Python Backend │ ├── app/ │ │ ├── **init**.py │ │ ├── main.py # FastAPI main application │ │ ├── config.py # Configuration settings │ │ └── routes/ │ │ ├── **init**.py │ │ ├── chat.py # Chat endpoints │ │ └── video.py # Video processing endpoints │ │ │ ├── rag/ # RAG Components │ │ ├── **init**.py │ │ ├── document_loader.py # YouTube transcript loader │ │ ├── text_splitter.py # Text chunking │ │ ├── embedding_model.py # Embedding generation │ │ ├── vector_store.py # Vector database operations │ │ ├── retriever.py # Context retrieval │ │ └── llm_handler.py # Gemini LLM integration │ │ │ ├── utils/ │ │ ├── **init**.py │ │ ├── youtube_utils.py # YouTube URL validation │ │ └── text_processing.py # Text preprocessing │ │ │ ├── data/ # Data storage │ │ ├── transcripts/ # Stored transcripts │ │ └── vectors/ # Vector store files │ │ │ ├── requirements.txt # Python dependencies │ └── .env # Environment variables │ ├── README.md # Project documentation ├── .gitignore # Git ignore file └── docker-compose.yml # Optional Docker setup `Key Components Breakdown: Frontend (React-Vite) * ****VideoInput.jsx****: Component for YouTube URL input * **ChatInterface.jsx**: Main chat interface with message history * ****MessageBubble.jsx****: Individual message components * **LoadingSpinner.jsx**: Loading states during processing Backend (Python FastAPI) * ****main.py****: FastAPI application entry point * **routes/**: API endpoints for video processing and chat * ****config.py****: Gemini API keys and other configurations RAG Pipeline Components: 1. ****document_loader.py****: Extracts YouTube video transcripts 2. ****text_splitter.py****: Splits transcript into manageable chunks 3. ****embedding_model.py****: Converts text to vector embeddings 4. ****vector_store.py****: Stores and manages vector database 5. ****retriever.py****: Finds relevant context for user queries 6. ****llm_handler.py****: Integrates with Gemini API for responses Utilities: * **youtube_utils.py**: URL validation and video ID extraction * **text_processing.py**: Text cleaning and preprocessing This structure follows clean architecture principles with clear separation of concerns for each RAG component while maintaining simplicity and readability.
+
+Look at this folder structure properly and check all the backend files that I have provided you... 
+
+your task : 
+
+write code for : src/components/ : 1)ChatInterface.jsx  2)VideoInput.jsx  3)MessageBubble.jsx  4)LoadingSpinner.jsx 
+
+ styles/  : 1)App.css 2)ChatInterface.css  3)VideoInput.css 4)MessageBubble.css
+
+
+code must be connected with backend and related with the functionality of backend and folder structure

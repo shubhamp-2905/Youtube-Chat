@@ -1,0 +1,19 @@
+/* styles/MessageBubble.css */
+.message-bubble {
+  padding: 10px;
+  border-radius: 8px;
+  margin: 5px 0;
+  max-width: 80%;
+  word-wrap: break-word;
+}
+.message-bubble.user {
+  background-color: #ffeaea;
+  align-self: flex-end;
+  text-align: right;
+  border: 1px solid #ff0000;
+}
+.message-bubble.bot {
+  background-color: #f1f1f1;
+  align-self: flex-start;
+  border: 1px solid #ddd;
+}
